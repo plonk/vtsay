@@ -1,0 +1,179 @@
+#!/usr/bin/ruby --disable-gems
+APP_NAME = 'vtsay'
+DEFAULT_FORMAT = 'wav'
+
+API_OPTIONS = %w[text speaker format emotion emotion_level pitch speed volume]
+
+def esc(str)
+  res = ""
+  str.each_char do |c|
+    case c
+    when '0'..'9', 'a'..'z', 'A'..'Z', '_', '-', '.'
+      res.concat(c)
+    when ' '
+      res.concat('+')
+    else
+      c.force_encoding('ASCII-8BIT').each_char do |d|
+        res.concat("%%%02X" % d.ord)
+      end
+    end
+  end
+  return res
+end
+
+def get_api_key
+  path = File.join(ENV['HOME'], '.voiceapi')
+  stat = File.stat(path)
+  if stat.uid == Process::Sys.getuid
+    # check permissions
+    if (stat.mode & 07777) > 0600
+      curmode = "%04o" % (stat.mode & 07777)
+      STDERR.puts("#{path}: Insecure permissions #{curmode}, 0600 suggested")
+    end
+  end
+  api = File.read(path).chomp
+  return api
+end
+
+def parse_options!(argv)
+  opts = {}
+  rest = []
+  until argv.empty?
+    s = argv.shift
+    case s
+    when "--"
+      rest.concat(argv)
+      break
+    when "-v"
+      if argv.empty?
+        STDERR.puts("-v requires parameter")
+        exit 1
+      end
+      opts['speaker'] = argv.shift
+    when "-o"
+      if argv.empty?
+        STDERR.puts("-o requires parameter")
+        exit 1
+      end
+      opts['output'] = argv.shift
+    when "-f"
+      if argv.empty?
+        STDERR.puts("-f requires parameter")
+        exit 1
+      end
+      opts['text'] = File.read(argv.shift)
+    when /\A--([^=]+)=(.*)\z/
+      origname = $1
+      value = $2
+      name = origname.gsub('-','_')
+      if API_OPTIONS.include?(name)
+        opts[name] = value
+      else
+        STDERR.puts("No such option #{name.inspect}")
+      end
+    else
+      rest << s
+    end
+  end
+  argv.replace(rest)
+  return opts
+end
+
+def get_response_code!(headers)
+  headers.rewind
+  _, code, _ = headers.gets.split(/\s+/, 3)
+  return code.to_i
+end
+
+def run_curl(headers, content, opts, api_key)
+  res = system("curl",
+               "https://api.voicetext.jp/v1/tts",
+               "-s",
+               "-D", headers.path,
+               "-u", api_key + ":",
+               *opts.flat_map { |k,v| ["-d", "#{k}=#{esc(v)}"] },
+               "-o", content.path)
+  case res
+  when nil
+    STDERR.puts("Error: Failed to run 'curl'")
+    exit 1
+  when false
+    STDERR.puts("Error: 'curl' exited with status code #{$?.exit_status}")
+    exit 1
+  end
+end
+
+def filetype(fn)
+  case File.extname(fn).downcase
+  when '.wav'
+    'wav'
+  when '.ogg', '.oga'
+    'ogg'
+  when '.mp3'
+    'mp3'
+  end
+end
+
+def main
+  opts = parse_options!(ARGV)
+
+  if opts["text"].nil? && ARGV.size == 0
+    STDERR.puts("vtsay [-v voice] [-o out.wav] [-f file.in | string ...]")
+    exit 1
+  else
+    opts["text"] ||= ARGV.join(' ')
+    opts["speaker"] ||= "hikari"
+
+    output = opts.delete("output")
+    if output
+      opts["format"] ||= (filetype(output) || DEFAULT_FORMAT)
+    else
+      opts["format"] ||= DEFAULT_FORMAT
+    end
+
+    begin
+      api_key = get_api_key
+    rescue Errno::ENOENT
+      STDERR.puts("Error: #{path} not found")
+      exit 1
+    rescue Errno::EACCES => e
+      STDERR.puts e.message
+      exit 1
+    end
+
+    require 'tempfile'
+    if output
+      content = File.open(output, "w+")
+    else
+      content = Tempfile.new(APP_NAME)
+    end
+    headers = Tempfile.new(APP_NAME)
+    begin
+      run_curl(headers, content, opts, api_key)
+      code = get_response_code!(headers)
+      case code
+      when 200
+        unless output
+          res = system("play", "-q", content.path, :err => "/dev/null")
+          if res.nil?
+            res = system("aplay", "-q", content.path, :err => "/dev/null")
+            if res.nil?
+              STDERR.puts("Neither play nor aplay command is available.")
+              STDERR.puts("Try 'apt-get install sox' (for play) or 'apt-get install alsa-utils' (for aplay)")
+            end
+          end
+        end
+      else
+        content.rewind
+        STDERR.puts(content.read)
+      end
+    ensure
+      content.close
+      content.unlink if content.is_a?(Tempfile)
+      headers.close
+      headers.unlink
+    end
+  end
+end
+
+main
