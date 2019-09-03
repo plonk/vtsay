@@ -1,8 +1,25 @@
 #!/usr/bin/ruby --disable-gems
 APP_NAME = 'vtsay'
+APP_VERSION = "0.1.0"
 DEFAULT_FORMAT = 'wav'
 
 API_OPTIONS = %w[text speaker format emotion emotion_level pitch speed volume]
+
+PLAYER_TO_TYPES = {
+  "play -q" => ["ogg", "wav"],
+  "aplay -q" => ["wav"],
+  "paplay" => ["ogg", "wav"],
+}
+TYPE_TO_PLAYERS = {}
+PLAYER_TO_TYPES.each do |pl,types|
+  types.each do |t|
+    TYPE_TO_PLAYERS[t] ||= []
+    TYPE_TO_PLAYERS[t] << pl
+  end
+end
+
+class UsageError < Exception
+end
 
 def esc(str)
   res = ""
@@ -46,22 +63,28 @@ def parse_options!(argv)
       break
     when "-v"
       if argv.empty?
-        STDERR.puts("-v requires parameter")
-        exit 1
+        fail UsageError, "-v requires parameter"
       end
       opts['speaker'] = argv.shift
     when "-o"
       if argv.empty?
-        STDERR.puts("-o requires parameter")
+        fail UsageError, "-o requires parameter"
         exit 1
       end
       opts['output'] = argv.shift
     when "-f"
       if argv.empty?
-        STDERR.puts("-f requires parameter")
-        exit 1
+        fail UsageError, "-f requires parameter"
       end
       opts['text'] = File.read(argv.shift)
+    when "--help"
+      print_usage
+      exit 0
+    when "--debug"
+      $DEBUG = true
+    when "--version"
+      print_version
+      exit 0
     when /\A--([^=]+)=(.*)\z/
       origname = $1
       value = $2
@@ -69,8 +92,10 @@ def parse_options!(argv)
       if API_OPTIONS.include?(name)
         opts[name] = value
       else
-        STDERR.puts("No such option #{name.inspect}")
+        fail UsageError, "No such option #{name.inspect}"
       end
+    when /\A-/
+      fail UsageError, "No such option #{s.inspect} (Use -- to separate options from speech text)"
     else
       rest << s
     end
@@ -114,11 +139,40 @@ def filetype(fn)
   end
 end
 
+def print_usage
+  STDERR.puts <<"EOD"
+Usage: #{APP_NAME} [-v voice] [-o out.wav] [-f file.in | string ...]
+
+-v [show|haruka|hikari|takeru|santa|bear]
+-o outfile
+-f infile
+
+--speaker=[show|haruka|hikari|takeru|santa|bear]
+--format=[ogg|wav|mp3] (defaults to ogg)
+--emotion=[happiness|anger|sadness] (only for haruka, hikari, takeru, santa, or bear)
+--emotion-level=NUMBER (range 1-4, also --emotion_level)
+--pitch=NUMBER (percentage, range 50-200)
+--speed=NUMBER (percentage, range 50-400)
+--volume=NUMBER (percentage, range 50-200)
+
+--debug
+        print debug messages
+--version
+        print version information and exit
+--help
+        display this help and exit
+EOD
+end
+
+def print_version
+  STDERR.puts "#{APP_NAME} version #{APP_VERSION}"
+end
+
 def main
   opts = parse_options!(ARGV)
 
   if opts["text"].nil? && ARGV.size == 0
-    STDERR.puts("vtsay [-v voice] [-o out.wav] [-f file.in | string ...]")
+    print_usage
     exit 1
   else
     opts["text"] ||= ARGV.join(' ')
@@ -133,8 +187,9 @@ def main
 
     begin
       api_key = get_api_key
-    rescue Errno::ENOENT
-      STDERR.puts("Error: #{path} not found")
+    rescue Errno::ENOENT => e
+      STDERR.puts e.message
+      STDERR.puts "API key file not found. You can get your API key at https://cloud.voicetext.jp/webapi"
       exit 1
     rescue Errno::EACCES => e
       STDERR.puts e.message
@@ -154,13 +209,16 @@ def main
       case code
       when 200
         unless output
-          res = system("play", "-q", content.path, :err => "/dev/null")
-          if res.nil?
-            res = system("aplay", "-q", content.path, :err => "/dev/null")
-            if res.nil?
-              STDERR.puts("Neither play nor aplay command is available.")
-              STDERR.puts("Try 'apt-get install sox' (for play) or 'apt-get install alsa-utils' (for aplay)")
+          players = TYPE_TO_PLAYERS[opts["format"]]
+          if players
+            players.each do |player|
+              STDERR.print "Executing %p ... " % [[*player.split, content.path]] if $DEBUG
+              res = system(*player.split, content.path, :err => "/dev/null")
+              STDERR.puts "%p" % [res] if $DEBUG
+              break if res
             end
+          else
+            STDERR.puts("Error: No players for type #{opts['format']} are found.")
           end
         end
       else
@@ -174,6 +232,10 @@ def main
       headers.unlink
     end
   end
+rescue UsageError => e
+  STDERR.puts e.message
+  print_usage
+  exit 1
 end
 
 main
